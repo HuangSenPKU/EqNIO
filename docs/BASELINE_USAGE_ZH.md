@@ -149,23 +149,27 @@ flowchart TD
 
 ### 共同的前累计 10 m 对齐
 
-设共同时间戳下的局部预测和真值水平位置为 $p_i,g_i$，从第一个共同有效样本 $i=0$ 开始：
+设共同时间戳下的局部预测和真值水平位置为 $p_i,g_i$。默认使用 `continuous` 协议：
+
+1. 相邻真值间隔超过 **1.5 s**，或水平位移除以时间超过 **3 m/s**，标记为连续性断点。
+2. 遇到断点，清空累计距离；最后一个断点后等待 **10 s**，选择新锚点 $a$。期间再出现断点则重新等待。无断点时仍从 $a=0$ 开始。
+3. 在同一连续段内，首次累计到 **10 m** 即结束；区间仅由真值及时间戳决定，两条 baseline 共用。
 
 $$
-j=\min\left\{k:\sum_{i=1}^{k}\|g_i-g_{i-1}\|_2\ge10\ \mathrm{m}\right\}.
+j=\min\left\{k:\sum_{i=a+1}^{k}\|g_i-g_{i-1}\|_2\ge10\ \mathrm{m}\right\}.
 $$
 
-在同一初始区间内，累加位移**向量**得到 $\Delta p=p_j-p_0$、$\Delta g=g_j-g_0$。固定方向偏置与对齐位置为：
+在同一初始区间内，累加位移**向量**得到 $\Delta p=p_j-p_a$、$\Delta g=g_j-g_a$。固定方向偏置与对齐位置为：
 
 $$
 \delta=\operatorname{atan2}(\Delta g_y,\Delta g_x)
 -\operatorname{atan2}(\Delta p_y,\Delta p_x),\qquad
-\widetilde p_i=R(\delta)(p_i-p_0)+g_0.
+\widetilde p_i=R(\delta)(p_i-p_a)+g_a.
 $$
 
-这里 $R$ 是二维旋转矩阵。**选区间用累计路径长度，求方向用累计位移向量的方向。** 不选后续直线段，不拟合尺度，不更新后续方向，也不使用设备真值 yaw。
+这里 $R$ 是二维旋转矩阵。**选区间用累计路径长度，求方向用累计位移向量的方向，平移也使用新锚点。** 不按预测误差选段，不拟合尺度，不更新后续方向，也不使用设备真值 yaw。若该区间的预测或真值净位移小于 **0.5 m**，明确报错，不为某个模型另选区间。
 
-变换到 $j$ 时刻才可用；图中更早的点是回溯变换。主指标只计算 $i>j$ 的点。固定初始偏置不能消除后续漂移。当前实现直接连接缺口两侧的有效真值点，不平滑或自动剔除跳变。
+变换到 $j$ 时刻才可用；图中更早的点是回溯变换。主指标只计算 $i>j$ 的点。原始真值和初始化后的位置评分样本保持不变，60 s 相对位移配对不能跨越断点。筛查阈值针对当前约 1 Hz 步行数据，不保证发现缓慢漂移，也不修复参考系统坐标重置。详细证据与复现实验见[真值跳变检查及修复](REFERENCE_JUMP_FIX_ZH.md)。使用 `--protocol legacy` 可复现旧规则，输出到新目录。
 
 ## 4 手动执行单条记录
 
@@ -182,7 +186,7 @@ python -B scripts/ronin_pedroam_6d.py \
   --out-root "$run_root/inference"
 python -B scripts/evaluate_initial_alignment.py \
   --result-root "$run_root/inference" \
-  --out-root "$run_root/alignment-10m" \
+  --out-root "$run_root/alignment-10m-continuous" \
   --initialization-distance-m 10 --label Madgwick
 ```
 
@@ -197,7 +201,7 @@ python -B scripts/tlio_pedroam.py \
   --out-root "$run_root/inference"
 python -B scripts/evaluate_initial_alignment.py \
   --result-root "$run_root/inference" \
-  --out-root "$run_root/alignment-10m" \
+  --out-root "$run_root/alignment-10m-continuous" \
   --initialization-distance-m 10 --label TLIO-EKF
 ```
 
@@ -214,13 +218,13 @@ python -B scripts/ronin_pedroam_6d.py \
   --out-root "$experiment_root/ronin/inference"
 python -B scripts/evaluate_initial_alignment.py \
   --result-root "$experiment_root/ronin/inference" \
-  --out-root "$experiment_root/ronin/alignment-10m" --label Madgwick
+  --out-root "$experiment_root/ronin/alignment-10m-continuous" --label Madgwick
 
 python -B scripts/tlio_pedroam.py --workers 8 \
   --out-root "$experiment_root/tlio/inference"
 python -B scripts/evaluate_initial_alignment.py \
   --result-root "$experiment_root/tlio/inference" \
-  --out-root "$experiment_root/tlio/alignment-10m" --label TLIO-EKF
+  --out-root "$experiment_root/tlio/alignment-10m-continuous" --label TLIO-EKF
 
 python -B scripts/summarize_tlio_baseline.py \
   --ronin-root "$experiment_root/ronin" \
@@ -229,7 +233,7 @@ python -B scripts/summarize_tlio_baseline.py \
 
 这组命令使用默认数据和权重目录；迁移到其他路径时，给两个推理入口分别增加相应参数。显存或内存不足时降低 TLIO 的 `--workers`，RoNIN 可降低 `--batch-size`（默认 256）。
 
-对比脚本当前要求 **13 条完整记录**、两侧相同的输入/真值哈希、预测时间戳和初始化区间，并要求输出 `report/` 尚不存在。它不适用于第 1 节的单条短样例；短样例直接查看各自的 `aggregate.csv` 即可。
+对比脚本当前要求 **13 条完整记录**、两侧相同的输入/真值哈希、预测时间戳和初始化区间，并要求输出 `report-continuous/` 尚不存在。它不适用于第 1 节的单条短样例；短样例直接查看各自的 `aggregate.csv` 即可。
 
 `summary.csv`、`failures.json` 会随推理更新；全部成功时 `failures.json` 为 `[]`。确认推理命令成功退出后再执行评估。原始数据和权重保持只读；输出目录不得放入数据集目录，已有推理/对齐目录不会被覆盖。
 
@@ -253,7 +257,7 @@ python -B scripts/summarize_tlio_baseline.py \
 │           ├── evaluation.csv       # 整段事后拟合诊断
 │           ├── trajectory_aligned_offline.csv
 │           └── trajectory.png       # 整段事后拟合图
-└── alignment-10m/
+└── alignment-10m-continuous/
     ├── aggregate.csv                # 论文使用的总体主指标
     ├── per_sequence.csv             # 逐序列主指标与初始化详情
     ├── run.json
@@ -270,7 +274,7 @@ python -B scripts/summarize_tlio_baseline.py \
 - RoNIN：`eqnio-ronin-o2-madgwick6d-b0.033-nonebias`。
 - TLIO：`eqnio-tlio-o2-ekf-madgwick-init`。
 
-默认评估标签是 `Madgwick`；TLIO 命令通过 `--label TLIO-EKF` 设置标签，因此其图位于 `alignment-10m/TLIO-EKF/…`。
+默认评估标签是 `Madgwick`；TLIO 命令通过 `--label TLIO-EKF` 设置标签，因此其图位于 `alignment-10m-continuous/TLIO-EKF/…`。
 
 ### 轨迹 CSV
 
@@ -287,6 +291,9 @@ python -B scripts/summarize_tlio_baseline.py \
 | 同上 | `gt_e_m,gt_n_m` | 真值 ENU 水平位置 |
 | 同上 | `initial_aligned_e_m,initial_aligned_n_m` | 在相同真值时刻插值并对齐的预测位置 |
 | 同上 | `horizontal_error_m,post_initialization` | 水平误差范数，以及是否计入主评估 |
+| 同上 | `gt_dt_s,gt_step_m,gt_speed_mps` | 到达该样本的真值时间间隔、水平位移及平均速度 |
+| 同上 | `gt_gap_flag,gt_speed_flag,gt_discontinuity` | 时间缺口、速度异常及二者合并标记 |
+| 同上 | `gt_segment,gt_anchor_ready` | 连续段编号，以及是否已通过断点后的等待期 |
 
 ### NPZ 诊断数据
 
@@ -305,9 +312,9 @@ python -B scripts/summarize_tlio_baseline.py \
 | `mean_initial_full_rmse_m` | 包含初始化段，非论文主指标 |
 | `mean_offline_full_rmse_m` | 使用整段真值最佳旋转和平移，只有诊断用途 |
 
-位置 RMSE 为 $\sqrt{\operatorname{mean}(\|\widetilde p_i-g_i\|_2^2)}$。60 s 指标比较两个端点间的预测与真值位移，不单独对齐每个片段；端点时间差容差为 0.1 s，不能跨越超过 2 s 的真值缺口，两个端点都在初始化结束后。
+位置 RMSE 为 $\sqrt{\operatorname{mean}(\|\widetilde p_i-g_i\|_2^2)}$。60 s 指标比较两个端点间的预测与真值位移，不单独对齐每个片段；端点时间差容差为 0.1 s，不能跨越被标记的连续性断点（旧版超过 2 s 的缺口限制也保留），两个端点都在初始化结束后。
 
-**论文数值读 `alignment-10m/aggregate.csv`，不要误用 `inference/summary.csv`。** 短序列没有合格的 60 s 配对时，该指标可能为空/NaN，不代表误差为零。
+**论文数值读 `alignment-10m-continuous/aggregate.csv`，不要误用 `inference/summary.csv`。** 短序列没有合格的 60 s 配对时，该指标可能为空/NaN，不代表误差为零。
 
 ## 7 用 Python 读取样例结果
 
@@ -320,27 +327,27 @@ import pandas as pd
 example = Path("outputs/你的样例目录")
 run = example / "tlio"  # 或 "ronin"
 label = "TLIO-EKF"      # RoNIN 使用 "Madgwick"
-folder = run / "alignment-10m" / label / "0423-PM-2026" / "P02"
+folder = run / "alignment-10m-continuous" / label / "0423-PM-2026" / "P02"
 
 trajectory = pd.read_csv(folder / "trajectory_initial_aligned.csv")
 evaluation = pd.read_csv(folder / "evaluation.csv")
 post = evaluation[evaluation["post_initialization"]]
 print(trajectory[["timestamp_ns", "east_m", "north_m"]].head())
 print("Post-init horizontal RMSE (m):", (post["horizontal_error_m"] ** 2).mean() ** 0.5)
-print(pd.read_csv(run / "alignment-10m" / "aggregate.csv"))
+print(pd.read_csv(run / "alignment-10m-continuous" / "aggregate.csv"))
 ```
 
-`trajectory.png` 可直接打开查看。完整对比报告在 TLIO 的 `report/` 中，包含英文 Markdown、逐序列及汇总 CSV，以及 `baseline_comparison.png`。
+`trajectory.png` 可直接打开查看。更新后的完整对比报告在 TLIO 的 `report-continuous/` 中，包含英文 Markdown、逐序列及汇总 CSV，以及 `baseline_comparison.png`。原有 `report/`、`alignment-10m/` 为保留的旧协议结果。
 
 ## 8 当前结果与常见问题
 
-当前完整实验目录为 `outputs/ronin-current/` 和 `outputs/tlio-current/`。全部 13 条记录的结果如下；短样例只用于验证执行流程，不能与该表直接比较：
+当前完整实验目录为 `outputs/ronin-current/` 和 `outputs/tlio-current/`，更新结果位于各自的 `alignment-10m-continuous/`。全部 13 条记录的结果如下；短样例只用于验证执行流程，不能与该表直接比较：
 
 | 初始化后指标 | RoNIN O2 | TLIO O2 + EKF |
 | --- | ---: | ---: |
-| 平均位置 RMSE | 105.16 m | 228.47 m |
-| 位置 RMSE 中位数 | 82.10 m | 168.35 m |
-| 平均 60 s 相对位移 RMSE | 17.91 m | 25.67 m |
+| 平均位置 RMSE | 98.06 m | 222.19 m |
+| 位置 RMSE 中位数 | 69.32 m | 168.35 m |
+| 平均 60 s 相对位移 RMSE | 16.71 m | 25.46 m |
 
 | 现象 | 处理方式 |
 | --- | --- |
@@ -349,11 +356,11 @@ print(pd.read_csv(run / "alignment-10m" / "aggregate.csv"))
 | 找不到 checkpoint/config | 按第 2 节检查两个入口不同的权重路径层级 |
 | `gap >100 ms`、非递增时间戳 | 检查输入；修复或按连续片段组织数据后再评估，不跨大缺口强行插值 |
 | `Insufficient valid ground-truth overlap` | 检查真值有效标记、时间单位、绝对时间基准，以及截取时长 |
-| `Reference path never reaches ...` | 初始区间没有足够的累计真值距离；延长样例，或选择有运动的记录 |
-| `Initial direction is undefined` | 初始化区间的预测或真值净位移为零；检查轨迹，不自动改选后续区间 |
-| 对比脚本拒绝执行 | 确认两侧都是同一组 13 条完整记录、默认处理设置一致，且目标 `report/` 不存在 |
+| `No continuous reference interval reaches ...` | 连续真值区间没有足够距离；检查断点及截取时长，不跨缺口强行累计 |
+| `Initial direction is undefined` | 初始区间净位移过小；检查轨迹，不自动改选后续区间 |
+| 对比脚本拒绝执行 | 确认两侧都是同一组 13 条完整记录、协议参数一致，且目标 `report-continuous/` 不存在 |
 | 轨迹看起来方向正确但仍明显漂移 | 固定初始对齐不保证消除姿态、速度或滤波误差；不进行后续真值纠偏 |
 
-`0422-AM1-2026/P02` 和 `P04` 起始真值存在约 37 m 跳变，仍包含在当前结果中；它会影响 10 m 初始化。已有文档中的这些结果不代表完全无外部信息的绝对航向定位。
+`0422-AM1-2026/P02` 和 `P04` 起始约 37 m 跳变已不再计入初始化；新锚点约为第 16 s，约第 40 s 完成累计 10 m（相对首个共同真值样本）。其余 11 条记录的对齐变换完全不变。这仍是有真值辅助的初始坐标对齐，不是完全无外部信息的绝对航向定位。
 
 实现入口：[RoNIN](../scripts/ronin_pedroam_6d.py)、[TLIO](../scripts/tlio_pedroam.py)、[共同对齐评估](../scripts/evaluate_initial_alignment.py)、[对比报告](../scripts/summarize_tlio_baseline.py)、[可执行样例](../scripts/run_baseline_example.sh)。新增适配和共享流程测试可用 `python -B -m unittest discover -s scripts -p 'test_*.py' -v` 执行；上游历史测试的失败及诊断见现有 TLIO 实验的 `validation/`。

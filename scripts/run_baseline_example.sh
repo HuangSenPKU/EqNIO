@@ -64,7 +64,7 @@ if [[ $model == ronin || $model == both ]]; then
     --out-root "$example_root/ronin/inference" "${cpu_args[@]}"
   "$python_bin" -B scripts/evaluate_initial_alignment.py \
     --result-root "$example_root/ronin/inference" \
-    --out-root "$example_root/ronin/alignment-10m" \
+    --out-root "$example_root/ronin/alignment-10m-continuous" \
     --initialization-distance-m 10 --label Madgwick
 fi
 if [[ $model == tlio || $model == both ]]; then
@@ -74,7 +74,7 @@ if [[ $model == tlio || $model == both ]]; then
     --out-root "$example_root/tlio/inference" "${cpu_args[@]}"
   "$python_bin" -B scripts/evaluate_initial_alignment.py \
     --result-root "$example_root/tlio/inference" \
-    --out-root "$example_root/tlio/alignment-10m" \
+    --out-root "$example_root/tlio/alignment-10m-continuous" \
     --initialization-distance-m 10 --label TLIO-EKF
 fi
 "$python_bin" -B - "$example_root" <<'PY'
@@ -83,7 +83,7 @@ import sys
 import pandas as pd
 root=Path(sys.argv[1])
 for baseline in ('ronin','tlio'):
-    path=root/baseline/'alignment-10m/aggregate.csv'
+    path=root/baseline/'alignment-10m-continuous/aggregate.csv'
     if path.exists():
         print(f'\n{baseline.upper()} — 180-second example, not the full dataset result')
         print(pd.read_csv(path).to_string(index=False))

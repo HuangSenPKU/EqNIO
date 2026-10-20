@@ -3,8 +3,9 @@ import unittest
 import numpy as np
 from evaluate_initial_alignment import (
     initial_transform,
-    cumulative_distance_index, cumulative_distance_transform,
+    cumulative_distance_index, cumulative_distance_transform, relative_rmse,
 )
+from reference_quality import reference_continuity, continuous_distance_interval
 
 
 class InitialAlignmentTests(unittest.TestCase):
@@ -61,6 +62,71 @@ class InitialAlignmentTests(unittest.TestCase):
         np.testing.assert_allclose(aligned[0], ref[0])
         self.assertAlmostEqual(np.linalg.det(r), 1.)
         self.assertAlmostEqual(np.linalg.norm(aligned[-1] - ref[-1]), 180.)
+
+
+class ReferenceContinuityTests(unittest.TestCase):
+    def test_jump_and_settling_cannot_supply_initial_distance(self):
+        t = np.arange(80.)
+        ref = np.column_stack([np.where(t < 5, 0., 37.) + np.maximum(t - 30, 0.),
+                               np.zeros(len(t))])
+        self.assertEqual(cumulative_distance_index(ref), 5)
+        self.assertEqual(continuous_distance_interval(t, ref), (15, 40))
+        quality = reference_continuity(t, ref)
+        self.assertTrue(quality["gt_speed_flag"][5])
+        self.assertFalse(quality["gt_anchor_ready"][14])
+        self.assertTrue(quality["gt_anchor_ready"][15])
+
+    def test_gap_resets_even_when_average_speed_is_plausible(self):
+        t = np.r_[np.arange(5.), np.arange(7., 50.)]
+        ref = np.column_stack([t, np.zeros(len(t))])
+        i, j = continuous_distance_interval(t, ref)
+        self.assertEqual((t[i], t[j]), (17., 27.))
+        self.assertFalse(reference_continuity(t, ref)["gt_speed_flag"].any())
+
+    def test_second_break_restarts_settling(self):
+        t = np.arange(60.)
+        x = t + 37 * (t >= 4) + 20 * (t >= 9)
+        ref = np.column_stack([x, t * 0])
+        self.assertEqual(continuous_distance_interval(t, ref), (19, 29))
+
+    def test_clean_data_retains_cumulative_path_protocol(self):
+        t = np.arange(20.)
+        ref = np.column_stack([np.minimum(t, 6), np.maximum(t - 6, 0)])
+        self.assertEqual(continuous_distance_interval(t, ref), (0, 10))
+        self.assertLess(np.linalg.norm(ref[10] - ref[0]), 10)
+
+    def test_reanchoring_and_future_independence(self):
+        t = np.arange(60.)
+        ref = np.column_stack([t + 37 * (t >= 5), np.zeros(len(t))])
+        pred = np.column_stack([np.zeros(len(t)), t])
+        i, j = continuous_distance_interval(t, ref)
+        r, tr, _ = initial_transform(pred, ref, i, j)
+        np.testing.assert_allclose(pred[i] @ r.T + tr, ref[i], atol=1e-10)
+        # The corrupt earlier reference is not retained as a translation anchor.
+        self.assertGreater(np.linalg.norm(pred[0] @ r.T + tr - ref[0]), 30)
+        ref[j + 1:] += 1e6
+        self.assertEqual(continuous_distance_interval(t, ref), (i, j))
+        self.assertEqual(continuous_distance_interval(t[:j + 1], ref[:j + 1]), (i, j))
+        r2, tr2, _ = initial_transform(pred, ref, i, j)
+        np.testing.assert_array_equal(r, r2)
+        np.testing.assert_array_equal(tr, tr2)
+
+    def test_no_eligible_segment_fails_explicitly(self):
+        t = np.arange(30.)
+        ref = np.column_stack([37 * (t >= 5), np.zeros(len(t))])
+        with self.assertRaisesRegex(ValueError, "No continuous"):
+            continuous_distance_interval(t, ref)
+        with self.assertRaisesRegex(ValueError, "strictly increasing"):
+            reference_continuity(t[::-1], ref)
+        with self.assertRaisesRegex(ValueError, "Nonfinite"):
+            reference_continuity(t, ref * np.nan)
+
+    def test_relative_metric_does_not_cross_speed_jump(self):
+        t = np.arange(130.)
+        error = np.column_stack([100 * (t >= 65), np.zeros(len(t))])
+        segments = (t >= 65).astype(int)
+        self.assertGreater(relative_rmse(t, error, 0), 0)
+        self.assertEqual(relative_rmse(t, error, 0, segments), 0)
 
 if __name__ == "__main__":
     unittest.main()

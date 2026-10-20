@@ -14,6 +14,8 @@ streams, or phone orientation. No additional gyro bias is subtracted.
   integration, and an offline alignment diagnostic.
 - `evaluate_initial_alignment.py`: the selected initial-position and cumulative
   10-metre heading correction, trajectory plots, and final metrics.
+- `reference_quality.py`: shared causal reference-continuity screening.
+- `audit_reference.py`: reference jumps/gaps, raw matching metadata, and plots.
 - `summarize_ronin_6d.py`: independently verifies intermediate trajectories using
   velocity reintegration and SVD, then summarizes the diagnostic metrics.
 - `test_*.py`: numerical tests for attitude, sensor selection, and alignment.
@@ -39,7 +41,7 @@ python -B scripts/ronin_pedroam_6d.py --out-root "$run_root/inference"
 python -B scripts/summarize_ronin_6d.py "$run_root/inference"
 python -B scripts/evaluate_initial_alignment.py \
   --result-root "$run_root/inference" \
-  --out-root "$run_root/alignment-10m" \
+  --out-root "$run_root/alignment-10m-continuous" \
   --initialization-distance-m 10
 ```
 
@@ -56,27 +58,37 @@ both sensor vectors into one continuous local frame. The first 10 seconds
 initialize the filter. O2 consumes 200-sample windows at stride 10; predicted
 XY velocities are assigned to window midpoints and integrated at 20 Hz.
 
-Ground truth enters only after inference. Starting at the first overlapping
-valid GT position, accumulate successive horizontal displacement lengths.
-Stop at the first sample reaching **10 metres**. Predicted and reference
-trajectories use this same initial interval. Subtract their accumulated
-vector directions to obtain one yaw offset, then translate the initial
-predicted position to the initial GT position. Keep this transform fixed.
-There is no scale fit, straightness selection, or later heading update.
+Ground truth enters only after inference. For these approximately 1 Hz pedestrian
+references, a gap above **1.5 s** or horizontal step speed above **3 m/s** resets
+initialization. Wait **10 s** after the last flagged transition, select a new
+position anchor, then accumulate **10 metres** within that continuous segment.
+Without a discontinuity, retain the original first-sample anchor. Both models
+use the same GT-selected interval. Its net-displacement directions define one
+yaw offset; translation anchors the prediction at the **selected start**.
+The transform stays fixed. No scale, straightness selection, or later updates
+are used. A net displacement below **0.5 m** in either trajectory fails explicitly
+without searching for another model-dependent interval.
 
 The direction comes from accumulated position differences, not measured phone
 yaw. Initialization ends at the threshold-crossing timestamp; earlier points
 are transformed retrospectively for plotting. Primary metrics exclude this
-initialization period. GT jumps and gaps are not silently filtered: the actual
-initialization distance, net displacement, duration, and maximum gap are saved.
+initialization period. Raw coordinates and all later position-scoring samples
+are retained. Reference continuity flags are exported; 60 s relative-displacement
+pairs crossing a flagged transition are excluded. Screening cannot repair a
+reference-frame reset or certify GT accuracy. Thresholds are CLI options, and
+`--protocol legacy` reproduces the previous gap-connecting initialization.
+
+The [reference-jump investigation](../docs/REFERENCE_JUMP_FIX_ZH.md) records the
+evidence, revised protocol, results, and commands to reevaluate saved predictions.
+Old `alignment-10m/` results remain available as legacy results.
 
 ## Current RoNIN results
 
 `outputs/ronin-current/` contains only the selected configuration:
 
-- `alignment-10m/aggregate.csv`: final mean and median sequence RMSE.
-- `alignment-10m/per_sequence.csv`: individual recording metrics.
-- `alignment-10m/Madgwick/<session>/<person>/`: corrected trajectory CSV,
+- `alignment-10m-continuous/aggregate.csv`: final mean and median sequence RMSE.
+- `alignment-10m-continuous/per_sequence.csv`: individual recording metrics.
+- `alignment-10m-continuous/Madgwick/<session>/<person>/`: corrected trajectory CSV,
   evaluation CSV, summary JSON, and `trajectory.png`.
 - `inference/`: original local predictions, attitude arrays, consumed-input
   hashes, checkpoint metadata, and independent verification.
@@ -110,7 +122,7 @@ python -B scripts/tlio_pedroam.py --workers 8 \
   --out-root "$run_root/inference"
 python -B scripts/evaluate_initial_alignment.py \
   --result-root "$run_root/inference" \
-  --out-root "$run_root/alignment-10m" --label TLIO-EKF
+  --out-root "$run_root/alignment-10m-continuous" --label TLIO-EKF
 ```
 
 Use `--session`, `--person`, and `--max-seconds 120` for a short run.
@@ -137,4 +149,6 @@ python -B scripts/summarize_tlio_baseline.py \
 
 The report verifies identical IMU/reference hashes, prediction timestamps,
 scoring samples, and 10 m initialization intervals. It independently checks the
-fixed transforms and metrics before writing comparison CSVs and a plot.
+fixed transforms and metrics before writing comparison CSVs and a plot to
+`outputs/tlio-current/report-continuous/`. Use `--alignment-subdir alignment-10m
+--report-subdir report-legacy-new` to audit legacy outputs into a fresh folder.
