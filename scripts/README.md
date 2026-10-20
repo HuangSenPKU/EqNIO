@@ -2,6 +2,28 @@
 
 中文流程、输入输出说明及可执行样例见 [Baseline 使用指南](../docs/BASELINE_USAGE_ZH.md)。快速运行：`bash scripts/run_baseline_example.sh both`。
 
+Run all selected recordings with explicit input and output locations:
+
+```bash
+conda activate eqnio
+python -B scripts/run_baselines.py \
+  --data-root /home/maxson/data/PedROAM --out-root outputs/my-baseline-run
+```
+
+The runner defaults to both baselines. Use `--model ronin|tlio|both`,
+`--session`, `--person`, `--max-seconds`, `--workers`, or `--cpu` as needed.
+The data root must contain `recordings/`. `--checkpoint-root` points to the
+parent of `Ronin_o2/` and `TLIO_o2/`. Relative paths resolve from the caller's
+working directory. `--dry-run` checks paths and prints commands without running.
+
+The runner executes inference, a shared reference audit, and continuous 10 m
+alignment, then writes top-level `summary.csv` and `per_sequence.csv` for any
+number of recordings. Per-model trajectories remain under
+`<model>/inference/` and `<model>/alignment-10m-continuous/`. Stage logs and a
+status manifest are retained, including on failure. Choose a fresh output
+directory outside the dataset and checkpoint directory. The 180-second
+`run_baseline_example.sh` is a preset of this same runner.
+
 The RoNIN pipeline uses calibrated `Gyroscope.csv` and
 `TotalAcceleration.csv`, Madgwick 6D with gain **0.033**, and the released
 EqNIO RoNIN O2 checkpoint. It does not read uncalibrated sensors, magnetic

@@ -2,6 +2,75 @@
 
 本文说明当前 **EqNIO-RoNIN O2** 和 **EqNIO-TLIO O2 + EKF** 的处理流程、输入输出，以及可以自行执行的实验命令。两者均使用发布的预训练权重，不在 PedROAM 上训练或微调，用于数据集论文的 Evaluation。
 
+## 统一入口：指定数据与结果目录
+
+激活 `eqnio` 后，只需要指定数据根目录和一个**尚不存在**的结果目录：
+
+```bash
+conda activate eqnio
+python -B scripts/run_baselines.py \
+  --data-root /home/maxson/data/PedROAM \
+  --out-root /home/maxson/code/pdr-test/EqNIO/outputs/my-baseline-run
+```
+
+默认对所有匹配记录运行两条 baseline，执行顺序为：推理、共享真值检查、
+各模型的连续累计 10 m 初始化评估，最后汇总指标。默认不训练或微调。
+`--data-root` 必须包含 `recordings/`，输入目录结构与 CSV 格式见第 2 节；
+不直接接受单个 `sensorlogger/` 文件夹。相对路径按启动命令时所在目录解析，
+也支持绝对路径和带空格的路径（命令行中需加引号）。
+
+仅运行 TLIO 的某一条完整记录：
+
+```bash
+python -B scripts/run_baselines.py \
+  --data-root /home/maxson/data/PedROAM \
+  --out-root outputs/my-tlio-run \
+  --model tlio --session 0422-AM1-2026 --person P02 --workers 1
+```
+
+快速验证时，可加 `--max-seconds 180`；只使用 CPU 时加 `--cpu`。
+截取时长必须留出姿态预热、有效真值区间和初始化后评分时间，
+否则程序会报错，而不是输出没有完成初始化的指标。
+
+| 参数 | 含义 |
+| --- | --- |
+| `--data-root` | 必填，包含 `recordings/` 的数据目录 |
+| `--out-root` | 必填，新结果目录，必须位于输入数据和权重目录之外 |
+| `--model ronin\|tlio\|both` | 运行方法，默认 `both` |
+| `--session`、`--person` | 可选记录筛选；省略时处理所有匹配记录 |
+| `--checkpoint-root` | 权重总目录，包含 `Ronin_o2/`、`TLIO_o2/` 中所选模型的子目录；默认使用本机已有权重 |
+| `--max-seconds` | 可选，每条记录仅处理开头指定秒数 |
+| `--workers` | TLIO 并行进程数，默认 4；不影响 RoNIN |
+| `--cpu` | 使用 CPU；没有可用 CUDA 时必须指定 |
+| `--dry-run` | 检查文件路径并打印命令，不推理、不创建结果目录；不验证权重内容 |
+
+输出结构如下；单模型运行只创建对应模型目录。汇总支持任意数量的记录：
+
+```text
+my-baseline-run/
+├── run.json                         # 参数、选中记录、各阶段命令与完成/失败状态
+├── summary.csv                      # 各 baseline 的初始化后汇总指标
+├── per_sequence.csv                 # 各 baseline 的逐记录指标
+├── logs/                            # 推理、真值检查、对齐各阶段日志
+├── reference-audit/                 # 共享真值跳变/缺口检查、初始段图
+├── ronin/
+│   ├── inference/                   # 原始局部轨迹与推理元数据
+│   └── alignment-10m-continuous/     # 对齐轨迹、误差、逐记录图
+└── tlio/
+    ├── inference/
+    └── alignment-10m-continuous/
+```
+
+统一入口沿用当前修复方案：间隔 >1.5 s 或速度 >3 m/s 时重置，
+等待 10 s 后重新锚定并累计 10 m；预测/真值净位移至少 0.5 m。
+详细原理见第 3 节。论文主指标读取顶层 `summary.csv`，不要使用
+`inference/summary.csv` 中整段事后最佳对齐的诊断指标。
+`initial_post_relative60_rmse_m` 在短记录没有有效配对时可能为空。
+
+运行失败会返回非零退出码，保留已完成阶段和日志，顶层 `run.json`
+标为 `failed`。不会把部分记录的结果汇总为一次成功实验，也不会自动覆盖
+或续跑已有目录。完整英文论文报告仍使用第 5 节的专用对比脚本生成。
+
 ## 1 先运行一个完整样例
 
 本机已配置 `eqnio` 环境。以下命令在仓库根目录执行：
