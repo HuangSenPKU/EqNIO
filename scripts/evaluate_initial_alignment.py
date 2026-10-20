@@ -76,7 +76,7 @@ def evaluate_runs(runs, out, initialization_distance_m=10.):
     for label, root in runs:
         manifest = json.loads((root / "run.json").read_text())
         method = manifest["method"]
-        assert manifest["bias_estimator"] == "none"
+        assert manifest["bias_estimator"] == {"ronin": "none", "tlio": "ekf"}[manifest.get("model_family", "ronin")]
         assert set(manifest["input_files"]) == {"Gyroscope.csv", "TotalAcceleration.csv"}
         table = pd.read_csv(root / "summary.csv")
         table = table[table.variant == "o2"].sort_values(["session", "person"])
@@ -85,7 +85,7 @@ def evaluate_runs(runs, out, initialization_distance_m=10.):
             assert keys == list(calibration), "Sequence sets differ"
         for row in table.itertuples():
             key = (row.session, row.person)
-            source = root / row.session / row.person / f"eqnio-ronin-o2-{method}"
+            source = root / row.session / row.person / manifest.get("trajectory_subdir", f"eqnio-ronin-o2-{method}")
             provenance = json.loads((source / "summary.json").read_text())
             ev = pd.read_csv(source / "evaluation.csv")
             ns = ev.timestamp_ns.to_numpy(np.int64)
@@ -93,7 +93,7 @@ def evaluate_runs(runs, out, initialization_distance_m=10.):
             pred = ev[["pred_local_x_m", "pred_local_y_m"]].to_numpy()
             ref = ev[["gt_e_m", "gt_n_m"]].to_numpy()
             identity = {k: provenance[k] for k in [
-                "checkpoint_sha256", "input_sha256", "reference_sha256"
+                "input_sha256", "reference_sha256"
             ]}
             if key not in calibration:
                 i, j = 0, cumulative_distance_index(ref, initialization_distance_m)
@@ -223,7 +223,8 @@ if __name__ == "__main__":
     parser.add_argument("--result-root", type=Path, default=root / "inference")
     parser.add_argument("--out-root", type=Path, default=root / "alignment-10m")
     parser.add_argument("--initialization-distance-m", type=float, default=10.)
+    parser.add_argument("--label", default="Madgwick")
     args = parser.parse_args()
     if not np.isfinite(args.initialization_distance_m) or args.initialization_distance_m <= 0:
         parser.error("Initialization distance must be finite and positive")
-    evaluate_runs([("Madgwick", args.result_root)], args.out_root, args.initialization_distance_m)
+    evaluate_runs([(args.label, args.result_root)], args.out_root, args.initialization_distance_m)

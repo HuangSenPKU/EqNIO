@@ -1,11 +1,11 @@
-# PedROAM: Madgwick + RoNIN O2
+# PedROAM Pretrained Inertial Odometry Baselines
 
-The maintained pipeline uses calibrated `Gyroscope.csv` and
+The RoNIN pipeline uses calibrated `Gyroscope.csv` and
 `TotalAcceleration.csv`, Madgwick 6D with gain **0.033**, and the released
 EqNIO RoNIN O2 checkpoint. It does not read uncalibrated sensors, magnetic
 streams, or phone orientation. No additional gyro bias is subtracted.
 
-## Files
+## RoNIN files
 
 - `attitude_6d.py`: compiled Madgwick IMU update, checked against AHRS 0.4.0.
 - `ronin_pedroam_6d.py`: sensor preparation, frozen O2 inference, local trajectory
@@ -16,7 +16,7 @@ streams, or phone orientation. No additional gyro bias is subtracted.
   velocity reintegration and SVD, then summarizes the diagnostic metrics.
 - `test_*.py`: numerical tests for attitude, sensor selection, and alignment.
 
-## Run
+## Run RoNIN
 
 Use the repository's `eqnio` Conda environment and install the extra dependency:
 
@@ -68,7 +68,7 @@ are transformed retrospectively for plotting. Primary metrics exclude this
 initialization period. GT jumps and gaps are not silently filtered: the actual
 initialization distance, net displacement, duration, and maximum gap are saved.
 
-## Current results
+## Current RoNIN results
 
 `outputs/ronin-current/` contains only the selected configuration:
 
@@ -85,3 +85,54 @@ The whole-trajectory best-fit metrics under `inference/` are diagnostics;
 they are not the selected initial-only evaluation. Generated files remain
 ignored by Git. The original upstream RONIN and TLIO source trees are separate
 from these maintained inference scripts.
+
+## EqNIO-TLIO O2 with the original EKF
+
+`tlio_pedroam.py` runs the released `TLIO_o2/checkpoint_best.pt`
+(`eq_o2_frame_fullCov_2vec_2deep`) with the upstream stochastic-cloning EKF.
+It reads the same two calibrated IMU streams and uses the same 100-to-200 Hz
+interpolation and output timestamp grid as the RoNIN baseline.
+
+Madgwick (gain 0.033) supplies the attitude at 10 s only. The EKF starts with
+zero position, velocity, and residual biases; the upstream non-VIO first-update
+position/velocity reset is retained. Thereafter, TLIO estimates attitude and
+residual biases internally. Its network receives gyro-integrated, locally
+heading-aligned one-second windows and predicts displacement plus covariance.
+The upstream learned-frame inverse rotation, covariance transformation, noise
+settings, covariance scale of 10, and Mahalanobis gating remain unchanged.
+No ground-truth attitude, velocity, position, or bias enters the filter.
+
+```bash
+run_root=outputs/tlio-new-run
+python -B scripts/tlio_pedroam.py --workers 8 \
+  --out-root "$run_root/inference"
+python -B scripts/evaluate_initial_alignment.py \
+  --result-root "$run_root/inference" \
+  --out-root "$run_root/alignment-10m" --label TLIO-EKF
+```
+
+Use `--session`, `--person`, and `--max-seconds 120` for a short run.
+Each recording runs in a separate process; `--workers` controls concurrency.
+The default output is `outputs/tlio-current/inference`, and existing run
+folders are never overwritten. Dataset and checkpoint files remain read-only.
+The current run stores local trajectories, compressed filter diagnostics,
+input/checkpoint hashes, and explicit filter configuration. Its final aligned
+trajectories and primary metrics use the same cumulative 10 m reference-assisted
+initialization and post-initialization evaluation as RoNIN.
+
+This is the **full TLIO network-plus-EKF baseline**, not standalone integration
+of the network's displacement predictions. RoNIN uses Madgwick throughout,
+whereas TLIO uses it only to initialize its own attitude estimator. Ground-truth
+position alignment is applied after inference to both baselines.
+
+After all 13 TLIO recordings and initial-alignment evaluations finish, generate
+an audited comparison and the English dataset-paper evaluation draft:
+
+```bash
+python -B scripts/summarize_tlio_baseline.py \
+  --ronin-root outputs/ronin-current --tlio-root outputs/tlio-current
+```
+
+The report verifies identical IMU/reference hashes, prediction timestamps,
+scoring samples, and 10 m initialization intervals. It independently checks the
+fixed transforms and metrics before writing comparison CSVs and a plot.
