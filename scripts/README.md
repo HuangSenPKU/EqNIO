@@ -1,5 +1,7 @@
 # PedROAM Pretrained Inertial Odometry Baselines
 
+中文流程、输入输出说明及可执行样例见 [Baseline 使用指南](../docs/BASELINE_USAGE_ZH.md)。快速运行：`bash scripts/run_baseline_example.sh both`。
+
 The RoNIN pipeline uses calibrated `Gyroscope.csv` and
 `TotalAcceleration.csv`, Madgwick 6D with gain **0.033**, and the released
 EqNIO RoNIN O2 checkpoint. It does not read uncalibrated sensors, magnetic
