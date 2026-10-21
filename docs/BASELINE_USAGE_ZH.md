@@ -370,6 +370,14 @@ python -B scripts/summarize_tlio_baseline.py \
 - TLIO `filter_diagnostics.npz`：`timestamp_ns`、`quat_wxyz`、`gyro_bias`（rad/s）、`accel_bias`（m/s²）、`state_covariance_diagonal`。
 - TLIO 协方差对角线按旋转误差、速度、位置、陀螺仪零偏、加速度计零偏排列，每组 3 维；保存的是**方差**，不是标准差。
 
+TLIO 同目录还会自动导出 `uncertainty_local.csv`，包含整数纳秒 `timestamp_ns` 和上述 15 个分量各自的方差、标准差，共 31 列；时间戳与 `trajectory_local.csv` 逐行一致。字段名包含轴、`variance` 或 `std` 和单位，例如 `local_position_x_variance_m2`、`local_position_x_std_m`。旋转误差、速度和位置使用滤波器局部坐标系，零偏使用 IMU 轴；旋转误差不是欧拉角。标准差由方差开平方得到，不代表实测误差，也未转换到对齐后的 ENU 坐标系。该文件不包含网络窗口位移协方差或状态间交叉协方差。
+
+已有结果无需重新推理，可从 NPZ 批量导出（重新执行会覆盖同名 CSV）：
+
+```bash
+python -B scripts/export_tlio_uncertainty.py --result-root outputs/tlio-current/inference
+```
+
 ### 指标如何读取
 
 | `aggregate.csv` 字段 | 含义 |

@@ -25,6 +25,7 @@ import numpy as np
 import pandas as pd
 from scipy.spatial.transform import Rotation
 import torch
+from export_tlio_uncertainty import write_uncertainty_csv
 from ronin_pedroam_6d import (
     SENSORS, estimate_orientation, evaluate, interpolate, read_sensor, sha256, write_json,
 )
@@ -149,6 +150,7 @@ def run_record(folder, data_root, out_root, max_seconds, ckpt, param, cpu, manif
     np.savez_compressed(out/'filter_diagnostics.npz', timestamp_ns=pred_ns,
                         quat_wxyz=debug[:,:4], gyro_bias=debug[:,4:7], accel_bias=debug[:,7:10],
                         state_covariance_diagonal=debug[:,10:])
+    write_uncertainty_csv(out/'uncertainty_local.csv', pred_ns, debug[:,10:])
     # First reference read occurs after all local outputs have been saved.
     reference=data_root/'recordings'/session/'reference'/person/'trajectory-gt.csv'
     reference_hash=sha256(reference)
