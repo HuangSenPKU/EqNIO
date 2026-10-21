@@ -32,6 +32,8 @@ def parse_args():
     parser.add_argument("--person", help="Optional phone/person ID, e.g. P02")
     parser.add_argument("--max-seconds", type=float, help="Process only the first N seconds per recording")
     parser.add_argument("--workers", type=int, default=4, help="TLIO worker processes (default: 4)")
+    parser.add_argument("--initialization-distance-m", type=float, default=10.,
+                        help="Shared initial GT travel distance for both inference and evaluation")
     parser.add_argument("--cpu", action="store_true", help="Use CPU for both models")
     parser.add_argument("--dry-run", action="store_true",
                         help="Validate input paths and print commands without creating results")
@@ -40,6 +42,8 @@ def parse_args():
         setattr(args, field, getattr(args, field).expanduser().resolve())
     if args.workers < 1:
         parser.error("--workers must be positive")
+    if not math.isfinite(args.initialization_distance_m) or args.initialization_distance_m <= 0:
+        parser.error("Initialization distance must be finite and positive")
     if args.max_seconds is not None and (not math.isfinite(args.max_seconds) or args.max_seconds <= 11):
         parser.error("--max-seconds must be finite and >11 (10 s warmup plus a 1 s model window)")
     return args
@@ -75,6 +79,10 @@ def preflight(args, models):
     return [{"session": f.parts[-4], "person": f.parts[-2]} for f in folders]
 
 
+def alignment_directory(distance_m):
+    return f"alignment-{distance_m:g}m-continuous"
+
+
 def commands(args, models):
     def command(script, *options):
         return [sys.executable, "-B", "-u", str(ROOT / "scripts" / script),
@@ -93,7 +101,8 @@ def commands(args, models):
         checkpoint = args.checkpoint_root if model == "ronin" else args.checkpoint_root / "TLIO_o2"
         inference = command("ronin_pedroam_6d.py" if model == "ronin" else "tlio_pedroam.py",
                             "--data-root", args.data_root, "--checkpoint-root", checkpoint,
-                            "--out-root", root / "inference", *filters)
+                            "--out-root", root / "inference",
+                            "--initialization-distance-m", args.initialization_distance_m, *filters)
         if model == "tlio":
             inference.extend(["--workers", str(args.workers)])
         steps.append((f"{model}-inference", inference))
@@ -102,17 +111,21 @@ def commands(args, models):
             steps.append(("reference-audit", command(
                 "audit_reference.py", "--data-root", args.data_root,
                 "--result-root", root / "inference", "--out-root", args.out_root / "reference-audit")))
+        # Both models export initial-aligned trajectories and comparison plots
+        # during inference. This stage reuses their transforms for reports.
         steps.append((f"{model}-alignment", command(
             "evaluate_initial_alignment.py", "--result-root", root / "inference",
-            "--out-root", root / ALIGNMENT, "--label", LABELS[model], "--protocol", "continuous")))
+            "--out-root", root / alignment_directory(args.initialization_distance_m),
+            "--initialization-distance-m", args.initialization_distance_m,
+            "--label", LABELS[model], "--protocol", "continuous")))
     return steps
 
 
-def merge_tables(out, models, source_name, target_name):
+def merge_tables(out, models, source_name, target_name, alignment=ALIGNMENT):
     """Collect model tables for any number of selected recordings."""
     rows, fields = [], None
     for model in models:
-        with (out / model / ALIGNMENT / source_name).open(newline="") as stream:
+        with (out / model / alignment / source_name).open(newline="") as stream:
             reader = csv.DictReader(stream)
             if fields is None:
                 fields = reader.fieldnames
@@ -179,8 +192,9 @@ def main():
             save_manifest()
             if returncode:
                 raise RuntimeError(f"{stage} failed; see logs/{stage}.log. Partial results have been retained.")
-        merge_tables(args.out_root, models, "aggregate.csv", "summary.csv")
-        merge_tables(args.out_root, models, "per_sequence.csv", "per_sequence.csv")
+        alignment = alignment_directory(args.initialization_distance_m)
+        merge_tables(args.out_root, models, "aggregate.csv", "summary.csv", alignment)
+        merge_tables(args.out_root, models, "per_sequence.csv", "per_sequence.csv", alignment)
         manifest["status"] = "completed"
     except BaseException as exc:
         manifest.update(status="failed", error=str(exc))

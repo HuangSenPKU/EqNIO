@@ -2,7 +2,8 @@
 """Frozen EqNIO RoNIN inference with magnetometer-free attitude on PedROAM.
 
 Only total acceleration and calibrated gyro enter the estimator. Reference
-positions are opened after prediction, solely for offline rigid XY evaluation.
+positions are opened after prediction for initial XY alignment and evaluation.
+Initial-aligned trajectories are exported before running evaluation.
 """
 from __future__ import annotations
 
@@ -24,6 +25,11 @@ import pandas as pd
 from scipy.integrate import cumulative_trapezoid
 from scipy.spatial.transform import Rotation, Slerp
 from attitude_6d import madgwick_orientation
+from reference_quality import (
+    continuous_distance_interval, DEFAULT_MAX_GAP_S, DEFAULT_MAX_SPEED_MPS,
+    DEFAULT_SETTLING_S,
+)
+from trajectory_alignment import initial_transform
 
 
 MODELS = {
@@ -151,12 +157,8 @@ def geodetic_to_enu(lat_deg, lon_deg, height):
     return (ecef - ecef[0]) @ rotation.T
 
 
-def evaluate(reference_path, ns, positions, velocity, out, attitude_label="Madgwick 6D"):
-    """Ground truth is consumed only here, after local inference is saved."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
+def matched_reference(reference_path, ns):
+    """Read valid overlapping GT: integer epoch ns and horizontal ENU metres."""
     gt = pd.read_csv(reference_path)
     columns = ["observation_utc_seconds", "gt_latitude", "gt_longitude", "gt_height"]
     valid = gt.gt_valid.astype(str).str.lower().eq("true")
@@ -168,11 +170,58 @@ def evaluate(reference_path, ns, positions, velocity, out, attitude_label="Madgw
     gt, gt_ns = gt.loc[overlap], gt_ns[overlap]
     if len(gt) < 3:
         raise ValueError("Insufficient valid ground-truth overlap")
-    t, tg = (ns - ns[0]) * 1e-9, (gt_ns - ns[0]) * 1e-9
-    pred = interpolate(tg, t, positions)
     ref = geodetic_to_enu(
         gt.gt_latitude.to_numpy(), gt.gt_longitude.to_numpy(), gt.gt_height.to_numpy()
     )[:, :2]
+    return gt_ns, ref, total_gt
+
+
+def export_initial_alignment(reference_path, ns, positions, velocity, out, distance_m=10.):
+    """Export 20 Hz aligned XY positions/velocities independently of scoring.
+
+    The fixed transform uses the first eligible continuous GT-distance interval.
+    It becomes available at that interval's end; earlier output is retrospective.
+    Rotation applies to position and velocity; translation applies only to position.
+    """
+    gt_ns, ref, _ = matched_reference(reference_path, ns)
+    t = (gt_ns - gt_ns[0]) * 1e-9
+    pred = interpolate((gt_ns - ns[0]) * 1e-9, (ns - ns[0]) * 1e-9, positions)
+    quality_options = dict(max_gap_s=DEFAULT_MAX_GAP_S,
+                           max_speed_mps=DEFAULT_MAX_SPEED_MPS,
+                           settling_s=DEFAULT_SETTLING_S)
+    i, j = continuous_distance_interval(t, ref, distance_m, **quality_options)
+    if min(np.linalg.norm(pred[j] - pred[i]), np.linalg.norm(ref[j] - ref[i])) < .5:
+        raise ValueError("Initial direction is undefined: net displacement < 0.5 m "
+                         "in the GT-selected interval; no model-dependent interval reselection")
+    rotation, translation, angle = initial_transform(pred, ref, i, j)
+    xy = positions @ rotation.T + translation
+    aligned_velocity = velocity @ rotation.T
+    metadata = {
+        "alignment_protocol": "continuous", "initialization_target_distance_m": distance_m,
+        "initialization_start_timestamp_ns": int(gt_ns[i]),
+        "initialization_end_timestamp_ns": int(gt_ns[j]),
+        "position_anchor_timestamp_ns": int(gt_ns[i]),
+        "heading_rotation_deg": float(np.rad2deg(angle)),
+        "rotation": rotation.tolist(), "translation": translation.tolist(),
+        "quality_options": quality_options, "minimum_net_displacement_m": .5,
+        "reference_sha256": sha256(reference_path),
+        "source_trajectory_sha256": sha256(out / "trajectory_local.csv"),
+        "causality": "fixed transform available at initialization end; earlier points retrospective",
+    }
+    pd.DataFrame({
+        "timestamp_ns": ns, "east_m": xy[:, 0], "north_m": xy[:, 1],
+        "velocity_e_mps": aligned_velocity[:, 0], "velocity_n_mps": aligned_velocity[:, 1],
+        "initialization_complete": ns > gt_ns[j],
+    }).to_csv(out / "trajectory_initial_aligned.csv", index=False)
+    write_json(out / "initial_alignment.json", metadata)
+    return metadata
+
+
+def evaluate(reference_path, ns, positions, velocity, out, attitude_label="Madgwick 6D"):
+    """Score local inference with the historical full-overlap fit diagnostic."""
+    gt_ns, ref, total_gt = matched_reference(reference_path, ns)
+    t, tg = (ns - ns[0]) * 1e-9, (gt_ns - ns[0]) * 1e-9
+    pred = interpolate(tg, t, positions)
     rotation, translation, angle = fit_yaw_translation(pred, ref)
     aligned = pred @ rotation.T + translation
     error = np.linalg.norm(aligned - ref, axis=1)
@@ -191,8 +240,8 @@ def evaluate(reference_path, ns, positions, velocity, out, attitude_label="Madgw
         "alignment": "full-overlap least-squares constant yaw + translation; no scale or reflection",
         "alignment_yaw_deg": float(np.rad2deg(angle)),
         "alignment_translation_m": translation.tolist(),
-        "reference_samples": len(gt), "valid_reference_samples_total": total_gt,
-        "reference_coverage": len(gt) / total_gt,
+        "reference_samples": len(gt_ns), "valid_reference_samples_total": total_gt,
+        "reference_coverage": len(gt_ns) / total_gt,
         "reference_duration_s": float(tg[-1] - tg[0]),
         "horizontal_rmse_m": float(np.sqrt(np.mean(error ** 2))),
         "horizontal_median_m": float(np.median(error)),
@@ -215,20 +264,86 @@ def evaluate(reference_path, ns, positions, velocity, out, attitude_label="Madgw
         "timestamp_ns": ns, "aligned_e_m": all_aligned[:, 0], "aligned_n_m": all_aligned[:, 1],
         "aligned_ve_mps": world_velocity[:, 0], "aligned_vn_mps": world_velocity[:, 1],
     }).to_csv(out / "trajectory_aligned_offline.csv", index=False)
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5), constrained_layout=True)
-    axes[0].plot(ref[:, 0], ref[:, 1], label="Reference", lw=1)
-    axes[0].plot(aligned[:, 0], aligned[:, 1], label=f"EqNIO + {attitude_label}", lw=1)
-    axes[0].set(xlabel="East (m)", ylabel="North (m)", aspect="equal",
-                title="Offline constant yaw + translation; no scale")
-    axes[0].legend()
-    axes[1].plot((tg - tg[0]) / 60, error, lw=1)
-    axes[1].set(xlabel="Time (min)", ylabel="Horizontal error (m)",
-                title=f"RMSE {metrics['horizontal_rmse_m']:.2f} m")
-    for ax in axes:
-        ax.grid(alpha=.25)
-    fig.savefig(out / "trajectory.png", dpi=160)
-    plt.close(fig)
+    plot_saved_trajectories(out, attitude_label)
     return metrics
+
+
+def plot_saved_trajectories(out, attitude_label="Madgwick 6D", output_path=None):
+    """Render distinct local/ENU trajectories and errors from saved CSVs only.
+
+    Local coordinates have their own panel. Both aligned trajectories retain
+    their 20 Hz output grid; errors are compared at the same GT timestamps.
+    Older runs and TLIO may lack an initial-aligned export in this directory.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out = Path(out)
+    local = pd.read_csv(out / "trajectory_local.csv", float_precision="round_trip")
+    offline = pd.read_csv(out / "trajectory_aligned_offline.csv", float_precision="round_trip")
+    ev = pd.read_csv(out / "evaluation.csv", float_precision="round_trip")
+    gt_ns = ev.timestamp_ns.to_numpy(np.int64)
+    elapsed_s = (gt_ns - gt_ns[0]) * 1e-9
+    ref = ev[["gt_e_m", "gt_n_m"]].to_numpy()
+    offline_error = ev.horizontal_error_m.to_numpy()
+    fig, axes = plt.subplots(1, 3, figsize=(17, 5.5), constrained_layout=True)
+    axes[0].plot(local.local_x_m, local.local_y_m, color="#7754a3", lw=1.2,
+                 label="Local prediction (no GT alignment)")
+    axes[0].scatter(local.local_x_m.iloc[0], local.local_y_m.iloc[0],
+                    color="#7754a3", marker="o", s=30, label="First output", zorder=4)
+    axes[0].set(xlabel="Local X (m)", ylabel="Local Y (m)", aspect="equal",
+                title="Raw local trajectory\nIndependent coordinate frame")
+    axes[1].plot(ref[:, 0], ref[:, 1], color="#222222", lw=1.8, label="GT", zorder=3)
+    axes[1].plot(offline.aligned_e_m, offline.aligned_n_m, color="#d97706",
+                 linestyle="--", lw=1.2, label="Full-trajectory fit (offline)")
+    axes[1].set(xlabel="East (m)", ylabel="North (m)", aspect="equal",
+                title="Aligned trajectories in ENU\nFixed yaw + translation; no scale")
+    axes[2].plot(elapsed_s / 60, offline_error, color="#d97706", linestyle="--",
+                 lw=1.1, label="Full-trajectory fit (offline)")
+    initial_path = out / "trajectory_initial_aligned.csv"
+    metadata_path = out / "initial_alignment.json"
+    if initial_path.exists() and metadata_path.exists():
+        initial = pd.read_csv(initial_path, float_precision="round_trip")
+        metadata = json.loads(metadata_path.read_text())
+        label = f"Initial {metadata['initialization_target_distance_m']:g} m alignment"
+        axes[1].plot(initial.east_m, initial.north_m, color="#0072b2", lw=1.3, label=label)
+        matched = interpolate(elapsed_s, (initial.timestamp_ns.to_numpy(np.int64) - gt_ns[0]) * 1e-9,
+                              initial[["east_m", "north_m"]].to_numpy())
+        initial_error = np.linalg.norm(matched - ref, axis=1)
+        axes[2].plot(elapsed_s / 60, initial_error, color="#0072b2", lw=1.2, label=label)
+        start_ns = metadata["initialization_start_timestamp_ns"]
+        end_ns = metadata["initialization_end_timestamp_ns"]
+        interval = (gt_ns >= start_ns) & (gt_ns <= end_ns)
+        axes[1].plot(ref[interval, 0], ref[interval, 1], color="#009e73", lw=3,
+                     label="GT initialization interval", zorder=4)
+        anchor = np.flatnonzero(gt_ns == start_ns)
+        if len(anchor):
+            axes[1].scatter(ref[anchor, 0], ref[anchor, 1], marker="*", s=90,
+                            color="#009e73", edgecolors="black", linewidths=.5,
+                            label="Position anchor", zorder=5)
+        axes[2].axvspan((start_ns - gt_ns[0]) / 60e9, (end_ns - gt_ns[0]) / 60e9,
+                       color="#009e73", alpha=.12, label="Initialization interval")
+        axes[2].axvline((end_ns - gt_ns[0]) / 60e9, color="#009e73", lw=1, linestyle=":")
+        post = gt_ns > end_ns
+        if post.any():
+            initial_rmse = np.sqrt(np.mean(initial_error[post] ** 2))
+            offline_rmse = np.sqrt(np.mean(offline_error[post] ** 2))
+            error_title = (f"Post-initialization RMSE (same timestamps)\n"
+                           f"Initial: {initial_rmse:.2f} m | Offline: {offline_rmse:.2f} m")
+        else:
+            error_title = "Horizontal error\nNo samples after initialization"
+    else:
+        error_title = (f"Offline full-overlap RMSE: {np.sqrt(np.mean(offline_error ** 2)):.2f} m\n"
+                       "Initial-aligned output unavailable")
+    axes[2].set(xlabel="Time since first matched GT (min)", ylabel="Horizontal error (m)",
+                title=error_title)
+    for ax in axes:
+        ax.legend(fontsize=8, loc="best")
+        ax.grid(alpha=.25)
+    fig.suptitle(f"{out.parent.parent.name} / {out.parent.name} | {attitude_label}", fontsize=13)
+    fig.savefig(out / "trajectory.png" if output_path is None else output_path, dpi=160)
+    plt.close(fig)
 
 
 def load_models(checkpoint_root, variants, device):
@@ -295,12 +410,16 @@ def main():
     parser.add_argument("--max-seconds", type=float)
     parser.add_argument("--warmup-seconds", type=float, default=10.0)
     parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--initialization-distance-m", type=float, default=10.,
+                        help="Continuous GT travel distance for automatic initial XY alignment")
     parser.add_argument("--cpu", action="store_true")
     args = parser.parse_args()
     if args.warmup_seconds < 0 or args.batch_size < 1:
         parser.error("warmup must be nonnegative and batch size positive")
     if not np.isfinite(args.madgwick_gain) or args.madgwick_gain <= 0:
         parser.error("Madgwick gain must be finite and positive")
+    if not np.isfinite(args.initialization_distance_m) or args.initialization_distance_m <= 0:
+        parser.error("Initialization distance must be finite and positive")
     if args.out_root.resolve().is_relative_to(args.data_root.resolve()):
         parser.error("Outputs must be outside the dataset")
     # Require a fresh run directory: never mix old summaries and new predictions.
@@ -323,6 +442,10 @@ def main():
         "acceleration": "total acceleration including gravity, m/s^2",
         "timestamp": "one-second window midpoint; trapezoidal velocity integration",
         "evaluation": "GT used only after inference; one fitted yaw and translation per recording/model",
+        "initial_alignment": "automatic fixed initial yaw and position alignment before evaluation",
+        "initialization_distance_m": args.initialization_distance_m,
+        "alignment_implementation_sha256": sha256(Path(__file__).with_name("trajectory_alignment.py")),
+        "reference_quality_sha256": sha256(Path(__file__).with_name("reference_quality.py")),
         "limitations": [
             "Offline yaw fitting uses the full reference overlap; this is not known true-north initialization.",
             "100 Hz input interpolated to 200 Hz adds no sensor bandwidth.",
@@ -366,6 +489,9 @@ def main():
                 }).to_csv(out / "trajectory_local.csv", index=False)
                 reference = args.data_root / "recordings" / session / "reference" / person / "trajectory-gt.csv"
                 reference_hash = sha256(reference)
+                alignment = export_initial_alignment(
+                    reference, pred_ns, position, velocity, out, args.initialization_distance_m)
+                print(f"  Initial-aligned trajectory: {out / 'trajectory_initial_aligned.csv'}", flush=True)
                 metrics = evaluate(reference, pred_ns, position, velocity, out, attitude_label)
                 unchanged = all(sha256(folder / name) == digest for name, digest in hashes.items())
                 unchanged &= sha256(reference) == reference_hash
@@ -374,6 +500,7 @@ def main():
                 summary = {
                     "session": session, "person": person, "variant": variant, "method": method,
                     **checkpoint_info, "quality": quality, "metrics": metrics,
+                    "initial_alignment": alignment,
                     "predictions": len(pred_ns), "input_sha256": hashes,
                     "reference_sha256": reference_hash, "inputs_unchanged": unchanged,
                     "rotation_equivariance_max_error_mps": equivariance_error,

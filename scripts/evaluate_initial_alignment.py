@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 
 os.environ.setdefault("MPLCONFIGDIR", str(Path(__file__).resolve().parents[1] / "outputs/.matplotlib"))
 import matplotlib
@@ -17,6 +18,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from trajectory_alignment import initial_transform
 from reference_quality import (
     reference_continuity, continuous_distance_interval,
     DEFAULT_MAX_GAP_S, DEFAULT_MAX_SPEED_MPS, DEFAULT_SETTLING_S,
@@ -25,19 +27,6 @@ from reference_quality import (
 
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def initial_transform(pred, ref, i, j):
-    """Anchor at i and use displacement from i to j; no scale."""
-    x, y = pred[j] - pred[i], ref[j] - ref[i]
-    lengths = np.array([np.linalg.norm(x), np.linalg.norm(y)])
-    if not np.isfinite(lengths).all() or np.any(lengths == 0):
-        raise ValueError("Initial direction is undefined: zero or nonfinite displacement")
-    angle = np.arctan2(x[0] * y[1] - x[1] * y[0], np.dot(x, y))
-    c, s = np.cos(angle), np.sin(angle)
-    rotation = np.array([[c, -s], [s, c]])
-    translation = ref[i] - pred[i] @ rotation.T
-    return rotation, translation, float(angle)
 
 
 def cumulative_distance_index(ref, distance_m=10.):
@@ -129,15 +118,30 @@ def evaluate_runs(runs, out, initialization_distance_m=10., protocol="continuous
                 raise ValueError(f"{label}/{row.session}/{row.person}: Initial direction is undefined: "
                                  f"net displacement < {min_displacement_m:g} m in the GT-selected interval; "
                                  "no model-dependent interval reselection")
-            rotation, translation, angle = initial_transform(pred, ref, i, j)
+            saved_path = source / "initial_alignment.json"
+            saved = json.loads(saved_path.read_text()) if saved_path.exists() else {}
+            reuse = (saved.get("alignment_protocol") == protocol
+                     and saved.get("initialization_target_distance_m") == initialization_distance_m
+                     and saved.get("quality_options") == quality_options
+                     and saved.get("minimum_net_displacement_m") == min_displacement_m)
+            if reuse:
+                assert saved["reference_sha256"] == provenance["reference_sha256"]
+                assert saved["source_trajectory_sha256"] == digest(source / "trajectory_local.csv")
+                assert saved["initialization_start_timestamp_ns"] == int(ns[i])
+                assert saved["initialization_end_timestamp_ns"] == int(ns[j])
+                rotation = np.asarray(saved["rotation"])
+                translation = np.asarray(saved["translation"])
+                angle = float(np.arctan2(rotation[1, 0], rotation[0, 0]))
+            else:
+                rotation, translation, angle = initial_transform(pred, ref, i, j)
             aligned = pred @ rotation.T + translation
             np.testing.assert_allclose(aligned[i], ref[i], atol=1e-9)
             np.testing.assert_allclose(np.linalg.det(rotation), 1., atol=1e-12)
             # Verify future reference changes cannot alter the chosen transform.
             assert select_interval(t[:j + 1], ref[:j + 1]) == (i, j)
             prefix_r, prefix_tr, _ = initial_transform(pred[:j + 1], ref[:j + 1], i, j)
-            np.testing.assert_array_equal(rotation, prefix_r)
-            np.testing.assert_array_equal(translation, prefix_tr)
+            np.testing.assert_allclose(rotation, prefix_r, atol=1e-10, rtol=0)
+            np.testing.assert_allclose(translation, prefix_tr, atol=1e-8, rtol=0)
             error = aligned - ref
             old_error = ev[["aligned_e_m", "aligned_n_m"]].to_numpy() - ref
             full_rmse = rmse(error)
@@ -160,6 +164,7 @@ def evaluate_runs(runs, out, initialization_distance_m=10., protocol="continuous
                 "gt_gap_flags": int(quality["gt_gap_flag"].sum()),
                 "pre_initialization_discontinuities": int(quality["gt_discontinuity"][:j + 1].sum()),
                 "heading_rotation_deg": float(np.rad2deg(angle)),
+                "alignment_reused_from_inference": reuse,
                 "initial_heading_pred_displacement_m": float(np.linalg.norm(pred[j] - pred[i])),
                 "initial_heading_gt_displacement_m": float(np.linalg.norm(ref[j] - ref[i])),
                 "reference_samples": len(ev), "post_initialization_samples": int(post.sum()),
@@ -196,27 +201,48 @@ def evaluate_runs(runs, out, initialization_distance_m=10., protocol="continuous
             local = pd.read_csv(source / "trajectory_local.csv")
             xy = local[["local_x_m", "local_y_m"]].to_numpy() @ rotation.T + translation
             velocity = local[["local_vx_mps", "local_vy_mps"]].to_numpy() @ rotation.T
-            pd.DataFrame({
+            trajectory = pd.DataFrame({
                 "timestamp_ns": local.timestamp_ns, "east_m": xy[:, 0], "north_m": xy[:, 1],
                 "velocity_e_mps": velocity[:, 0], "velocity_n_mps": velocity[:, 1],
                 "initialization_complete": local.timestamp_ns > ns[j],
-            }).to_csv(target / "trajectory_initial_aligned.csv", index=False)
-            fig, axes = plt.subplots(1, 2, figsize=(11, 4), constrained_layout=True)
-            axes[0].plot(ref[:, 0], ref[:, 1], label="GT", lw=1)
-            axes[0].plot(aligned[:, 0], aligned[:, 1], label="Initial alignment", lw=1)
-            axes[0].plot(ref[i:j + 1, 0], ref[i:j + 1, 1], lw=3, label="Heading initialization")
-            axes[0].set(xlabel="East (m)", ylabel="North (m)", aspect="equal")
-            axes[0].legend(fontsize=8)
-            axes[1].plot(t / 60, np.linalg.norm(error, axis=1), label="Initial alignment")
-            axes[1].plot(t / 60, np.linalg.norm(old_error, axis=1), label="Offline full-trajectory fit", alpha=.7)
-            axes[1].axvline(t[j] / 60, color="gray", linestyle="--")
-            axes[1].set(xlabel="Time (minutes)", ylabel="Horizontal error (m)")
-            axes[1].legend(fontsize=8)
-            for ax in axes:
-                ax.grid(alpha=.25)
-            fig.suptitle(f"{label} | {row.session}/{row.person} | Post-init RMSE {values['initial_post_rmse_m']:.1f} m")
-            fig.savefig(target / "trajectory.png", dpi=140)
-            plt.close(fig)
+            })
+            if reuse:
+                saved_csv = source / "trajectory_initial_aligned.csv"
+                exported = pd.read_csv(saved_csv, float_precision="round_trip")
+                np.testing.assert_array_equal(exported.timestamp_ns, trajectory.timestamp_ns)
+                np.testing.assert_array_equal(exported.initialization_complete,
+                                              trajectory.initialization_complete)
+                # Local CSV velocities were serialized from float32 model outputs;
+                # recomputing from their decimal representation loses a few ulps.
+                columns = ["east_m", "north_m", "velocity_e_mps", "velocity_n_mps"]
+                np.testing.assert_allclose(exported[columns], trajectory[columns], atol=1e-7, rtol=1e-7)
+                shutil.copyfile(saved_csv, target / "trajectory_initial_aligned.csv")
+            else:
+                trajectory.to_csv(target / "trajectory_initial_aligned.csv", index=False)
+            if reuse:
+                from ronin_pedroam_6d import plot_saved_trajectories
+                plot_saved_trajectories(source, label, target / "trajectory.png")
+            else:
+                fig, axes = plt.subplots(1, 2, figsize=(11, 4), constrained_layout=True)
+                axes[0].plot(ref[:, 0], ref[:, 1], label="GT", color="#222222", lw=1)
+                axes[0].plot(aligned[:, 0], aligned[:, 1], label="Initial alignment", color="#0072b2", lw=1)
+                offline_xy = ev[["aligned_e_m", "aligned_n_m"]].to_numpy()
+                axes[0].plot(offline_xy[:, 0], offline_xy[:, 1], label="Full-trajectory fit (offline)",
+                             color="#d97706", linestyle="--", lw=1)
+                axes[0].plot(ref[i:j + 1, 0], ref[i:j + 1, 1], color="#009e73", lw=3,
+                             label="GT initialization interval")
+                axes[0].set(xlabel="East (m)", ylabel="North (m)", aspect="equal")
+                axes[1].plot(t / 60, np.linalg.norm(error, axis=1), label="Initial alignment", color="#0072b2")
+                axes[1].plot(t / 60, np.linalg.norm(old_error, axis=1), label="Full-trajectory fit (offline)",
+                             color="#d97706", linestyle="--")
+                axes[1].axvline(t[j] / 60, color="#009e73", linestyle=":")
+                axes[1].set(xlabel="Time (minutes)", ylabel="Horizontal error (m)")
+                for ax in axes:
+                    ax.legend(fontsize=8)
+                    ax.grid(alpha=.25)
+                fig.suptitle(f"{label} | {row.session}/{row.person} | Post-init RMSE {values['initial_post_rmse_m']:.1f} m")
+                fig.savefig(target / "trajectory.png", dpi=140)
+                plt.close(fig)
             checks.append({"estimator": label, "session": row.session, "person": row.person,
                            "initial_position_exact": True, "prefix_only_transform": True,
                            "proper_rotation_no_scale": True})
@@ -233,6 +259,7 @@ def evaluate_runs(runs, out, initialization_distance_m=10., protocol="continuous
     aggregate.to_csv(out / "aggregate.csv", index=False)
     (out / "run.json").write_text(json.dumps({
         "script_sha256": digest(Path(__file__)),
+        "alignment_implementation_sha256": digest(Path(__file__).with_name("trajectory_alignment.py")),
         "reference_quality_sha256": digest(Path(__file__).with_name("reference_quality.py")),
         "runs": {label: str(root.resolve()) for label, root in runs},
         "variant": "o2", "protocol": protocol,

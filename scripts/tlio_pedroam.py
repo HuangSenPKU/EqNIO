@@ -3,7 +3,8 @@
 
 Madgwick supplies only the initial attitude after 10 s. Subsequent attitude,
 velocity, position and residual biases belong to TLIO's EKF. No GT is accessed
-until local inference has finished. Evaluation uses the shared 10 m protocol.
+until local inference has finished. Initial-aligned XY trajectories are exported
+before evaluation using the shared continuous 10 m protocol.
 """
 from __future__ import annotations
 
@@ -27,7 +28,8 @@ from scipy.spatial.transform import Rotation
 import torch
 from export_tlio_uncertainty import write_uncertainty_csv
 from ronin_pedroam_6d import (
-    SENSORS, estimate_orientation, evaluate, interpolate, read_sensor, sha256, write_json,
+    SENSORS, estimate_orientation, evaluate, export_initial_alignment, interpolate,
+    read_sensor, sha256, write_json,
 )
 sys.path.insert(0, str(ROOT / "TLIO-master/src"))
 from tracker.imu_tracker import ImuTracker
@@ -154,13 +156,18 @@ def run_record(folder, data_root, out_root, max_seconds, ckpt, param, cpu, manif
     # First reference read occurs after all local outputs have been saved.
     reference=data_root/'recordings'/session/'reference'/person/'trajectory-gt.csv'
     reference_hash=sha256(reference)
+    alignment = export_initial_alignment(
+        reference, pred_ns, states[:, :2], states[:, 3:5], out,
+        manifest.get('initialization_distance_m', 10.))
+    print(f"  Initial-aligned trajectory: {out / 'trajectory_initial_aligned.csv'}", flush=True)
     metrics=evaluate(reference,pred_ns,states[:,:2],states[:,3:5],out,'TLIO O2 + EKF')
     assert all(sha256(folder/name)==digest for name,digest in hashes.items())
     assert sha256(reference)==reference_hash
     summary=dict(session=session,person=person,variant='o2',method=METHOD,
                  checkpoint_sha256=manifest['checkpoint_sha256'],input_sha256=hashes,
                  reference_sha256=reference_hash,inputs_unchanged=True,metrics=metrics,
-                 predictions=len(indices),quality=quality,filter_status=status)
+                 predictions=len(indices),quality=quality,filter_status=status,
+                 initial_alignment=alignment)
     write_json(out/'summary.json',summary)
     print(f"  {session}/{person}: saved {len(indices)} states; offline diagnostic RMSE {metrics['horizontal_rmse_m']:.2f} m",flush=True)
     return dict(session=session,person=person,variant='o2',**status,
@@ -177,9 +184,13 @@ def main():
     parser.add_argument('--max-seconds', type=float)
     parser.add_argument('--cpu', action='store_true')
     parser.add_argument('--workers', type=int, default=4)
+    parser.add_argument('--initialization-distance-m', type=float, default=10.,
+                        help='Continuous GT travel distance for automatic initial XY alignment')
     args = parser.parse_args()
     if args.workers < 1:
         parser.error('workers must be positive')
+    if not np.isfinite(args.initialization_distance_m) or args.initialization_distance_m <= 0:
+        parser.error('Initialization distance must be finite and positive')
     if args.out_root.resolve().is_relative_to(args.data_root.resolve()):
         parser.error('Outputs must be outside the dataset')
     ckpt, param = args.checkpoint_root/'checkpoint_best.pt', args.checkpoint_root/'parameters.json'
@@ -206,7 +217,13 @@ def main():
         initialization='Madgwick beta=.033 at 10 s; zero position, velocity and residual biases; upstream first-update p/v reset',
         attitude='Madgwick only for initialization, then original TLIO EKF and within-window gyro integration',
         network_hz=200, filter_hz=200, update_hz=20, window_samples=200,
-        evaluation='GT opened after inference only; shared cumulative 10 m fixed yaw/translation; XY metrics',
+        initial_alignment='automatic fixed initial yaw and position alignment before evaluation',
+        initialization_distance_m=args.initialization_distance_m,
+        evaluation='GT opened after inference only; full-overlap fit diagnostic; optional initial-alignment report',
+        shared_output_source_sha256={name:sha256(ROOT/'scripts'/name) for name in [
+            'ronin_pedroam_6d.py', 'trajectory_alignment.py', 'reference_quality.py',
+            'export_tlio_uncertainty.py',
+        ]},
         original_source_sha256={str(p.relative_to(ROOT)):sha256(p) for p in [
             ROOT/'TLIO-master/src/tracker/imu_tracker.py', ROOT/'TLIO-master/src/tracker/scekf.py',
             ROOT/'TLIO-master/src/tracker/meas_source_torchscript.py',

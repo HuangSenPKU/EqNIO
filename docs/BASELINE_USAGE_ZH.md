@@ -15,6 +15,7 @@ python -B scripts/run_baselines.py \
 
 默认对所有匹配记录运行两条 baseline，执行顺序为：推理、共享真值检查、
 各模型的连续累计 10 m 初始化评估，最后汇总指标。默认不训练或微调。
+两个推理入口均直接生成初始对齐 CSV 和三栏对比图；评估复用已保存的变换。
 `--data-root` 必须包含 `recordings/`，输入目录结构与 CSV 格式见第 2 节；
 不直接接受单个 `sensorlogger/` 文件夹。相对路径按启动命令时所在目录解析，
 也支持绝对路径和带空格的路径（命令行中需加引号）。
@@ -41,6 +42,7 @@ python -B scripts/run_baselines.py \
 | `--checkpoint-root` | 权重总目录，包含 `Ronin_o2/`、`TLIO_o2/` 中所选模型的子目录；默认使用本机已有权重 |
 | `--max-seconds` | 可选，每条记录仅处理开头指定秒数 |
 | `--workers` | TLIO 并行进程数，默认 4；不影响 RoNIN |
+| `--initialization-distance-m` | 两种算法及评估共享的初始化累计距离，默认 10 m；报告目录随距离命名 |
 | `--cpu` | 使用 CPU；没有可用 CUDA 时必须指定 |
 | `--dry-run` | 检查文件路径并打印命令，不推理、不创建结果目录；不验证权重内容 |
 
@@ -54,7 +56,7 @@ my-baseline-run/
 ├── logs/                            # 推理、真值检查、对齐各阶段日志
 ├── reference-audit/                 # 共享真值跳变/缺口检查、初始段图
 ├── ronin/
-│   ├── inference/                   # 原始局部轨迹与推理元数据
+│   ├── inference/                   # 局部轨迹、自动初始对齐轨迹与推理元数据
 │   └── alignment-10m-continuous/     # 对齐轨迹、误差、逐记录图
 └── tlio/
     ├── inference/
@@ -253,6 +255,15 @@ python -B scripts/ronin_pedroam_6d.py \
   --checkpoint-root ../outputs/eqnio-pretrained \
   --session 0423-PM-2026 --person P02 \
   --out-root "$run_root/inference"
+```
+
+这条命令会在每条记录的推理目录内自动生成 `trajectory_initial_aligned.csv`（20 Hz，位置和速度均已旋转）与 `initial_alignment.json`（固定旋转、平移、初始化区间及来源哈希）。无需额外执行评估即可取得对齐轨迹。默认使用连续累计 10 m；可用 `--initialization-distance-m` 修改。若有效连续轨迹不足 10 m 或方向无法确定，命令报错并保留局部推理结果，不会输出伪对齐结果。对齐依赖初始 GT，变换在初始化结束后才可用；之前的点为回溯变换。
+
+推理目录的 `trajectory.png` 分三栏：原始局部轨迹、ENU 下的 GT/初始对齐/整段事后拟合轨迹、两种对齐的水平误差。蓝色实线表示初始对齐，橙色虚线表示整段拟合，黑色表示 GT；绿色标出初始化区间与位置锚点。误差在相同 GT 时间戳比较，标题中的两种 RMSE 均仅统计初始化结束后。`evaluation.csv` 和推理根目录 `summary.csv` 仍保存原有整段拟合诊断指标。
+
+只有需要初始化后误差指标和图表时，再运行下列评估命令；参数一致时会复用推理阶段保存的变换：
+
+```bash
 python -B scripts/evaluate_initial_alignment.py \
   --result-root "$run_root/inference" \
   --out-root "$run_root/alignment-10m-continuous" \
@@ -268,6 +279,13 @@ python -B scripts/tlio_pedroam.py \
   --checkpoint-root ../outputs/eqnio-pretrained/TLIO_o2 \
   --session 0423-PM-2026 --person P02 --workers 1 \
   --out-root "$run_root/inference"
+```
+
+TLIO 与 RoNIN 一样，会在推理目录直接生成 `trajectory_initial_aligned.csv`、`initial_alignment.json` 及区分原始局部轨迹、初始对齐、整段拟合的 `trajectory.png`，无需单独评估即可查看。默认初始连续累计距离为 10 m，可通过 `--initialization-distance-m` 修改。对齐只处理水平位置和速度；`trajectory_local.csv` 仍包含原始 Z 分量，`uncertainty_local.csv` 的方差和标准差仍属于滤波器局部坐标系，不能作为 ENU 协方差直接使用。
+
+需要初始化后指标报告时，再执行（使用与推理相同的初始化距离）：
+
+```bash
 python -B scripts/evaluate_initial_alignment.py \
   --result-root "$run_root/inference" \
   --out-root "$run_root/alignment-10m-continuous" \
@@ -309,6 +327,9 @@ python -B scripts/summarize_tlio_baseline.py \
 ## 6 输出文件和字段说明
 
 将某种方法的运行目录记为 `<run>`，例如样例中的 `…/tlio`：
+
+RoNIN 和 TLIO 的推理目录都直接包含 `trajectory_initial_aligned.csv` 和 `initial_alignment.json`。
+下方 `alignment-10m-continuous/` 是可选评估报告目录；统一运行器仍会自动生成它，复用两种算法已保存的初始变换，图像也使用同一三栏样式。
 
 ```text
 <run>/

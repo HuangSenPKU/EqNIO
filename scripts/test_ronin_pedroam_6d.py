@@ -2,15 +2,61 @@
 import unittest
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
 from scipy.spatial.transform import Rotation
 
-from ronin_pedroam_6d import estimate_orientation, fit_yaw_translation, prepare
+from ronin_pedroam_6d import (
+    estimate_orientation, fit_yaw_translation, prepare, export_initial_alignment,
+)
 
 
 class SixAxisTests(unittest.TestCase):
+    def test_initial_export_without_evaluation_preserves_timestamps_and_rotates_velocity(self):
+        ns = 1_770_000_000_000_000_000 + np.arange(601, dtype=np.int64) * 50_000_000
+        t = (ns - ns[0]) * 1e-9
+        position = np.column_stack([t, np.zeros(len(t))])
+        velocity = np.tile([1., 0.], (len(t), 1))
+        gt_ns = ns[::20]
+        # A jump at 5 s forces the shared protocol to reanchor at 15 s.
+        ref = np.column_stack([np.full(len(gt_ns), 12.),
+                               np.arange(len(gt_ns)) + 37 * (np.arange(len(gt_ns)) >= 5)])
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            reference = out / "reference.csv"
+            reference.write_text("synthetic reference")
+            pd.DataFrame({"timestamp_ns": ns, "local_x_m": position[:, 0],
+                          "local_y_m": position[:, 1]}).to_csv(out / "trajectory_local.csv", index=False)
+            with patch("ronin_pedroam_6d.matched_reference", return_value=(gt_ns, ref, len(ref))):
+                result = export_initial_alignment(reference, ns, position, velocity, out)
+            csv = pd.read_csv(out / "trajectory_initial_aligned.csv")
+            np.testing.assert_array_equal(csv.timestamp_ns, ns)
+            np.testing.assert_allclose(csv.east_m, 12., atol=1e-12)
+            np.testing.assert_allclose(csv.north_m, t + 37., atol=1e-12)
+            np.testing.assert_allclose(csv.velocity_e_mps, 0., atol=1e-12)
+            np.testing.assert_allclose(csv.velocity_n_mps, 1., atol=1e-12)
+            self.assertEqual(result["initialization_start_timestamp_ns"], int(gt_ns[15]))
+            self.assertEqual(result["initialization_end_timestamp_ns"], int(gt_ns[25]))
+            np.testing.assert_array_equal(csv.initialization_complete, ns > gt_ns[25])
+            ref[26:] += 1e6
+            with patch("ronin_pedroam_6d.matched_reference", return_value=(gt_ns, ref, len(ref))):
+                future_changed = export_initial_alignment(reference, ns, position, velocity, out)
+            self.assertEqual(result, future_changed)
+            pd.testing.assert_frame_equal(csv, pd.read_csv(out / "trajectory_initial_aligned.csv"))
+            self.assertFalse((out / "evaluation.csv").exists())
+
+    def test_initial_export_rejects_insufficient_travel_without_aligned_output(self):
+        ns = np.arange(20, dtype=np.int64) * 1_000_000_000
+        position = np.zeros((len(ns), 2))
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory)
+            with patch("ronin_pedroam_6d.matched_reference", return_value=(ns, position, len(ns))):
+                with self.assertRaisesRegex(ValueError, "No continuous"):
+                    export_initial_alignment(out / "unused.csv", ns, position, position, out)
+            self.assertFalse((out / "trajectory_initial_aligned.csv").exists())
+
     def test_tilted_stationary_sensor_aligns_up_without_magnetometer(self):
         acceleration = np.tile([3.0, 4.0, np.sqrt(9.81 ** 2 - 25)], (2000, 1))
         state = estimate_orientation(np.zeros_like(acceleration), acceleration)

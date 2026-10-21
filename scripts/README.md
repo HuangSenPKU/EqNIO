@@ -16,6 +16,10 @@ The data root must contain `recordings/`. `--checkpoint-root` points to the
 parent of `Ronin_o2/` and `TLIO_o2/`. Relative paths resolve from the caller's
 working directory. `--dry-run` checks paths and prints commands without running.
 
+Both inference scripts export initial-aligned trajectories before evaluation.
+The runner forwards `--initialization-distance-m` (default 10) to both models
+and reports, storing reports under `alignment-<distance>m-continuous/`.
+
 The runner executes inference, a shared reference audit, and continuous 10 m
 alignment, then writes top-level `summary.csv` and `per_sequence.csv` for any
 number of recordings. Per-model trajectories remain under
@@ -33,9 +37,10 @@ streams, or phone orientation. No additional gyro bias is subtracted.
 
 - `attitude_6d.py`: compiled Madgwick IMU update, checked against AHRS 0.4.0.
 - `ronin_pedroam_6d.py`: sensor preparation, frozen O2 inference, local trajectory
-  integration, and an offline alignment diagnostic.
-- `evaluate_initial_alignment.py`: the selected initial-position and cumulative
-  10-metre heading correction, trajectory plots, and final metrics.
+  integration, automatic initial position/heading alignment, and an offline alignment diagnostic.
+- `trajectory_alignment.py`: shared initial rigid XY transform.
+- `evaluate_initial_alignment.py`: reuses the saved initial transform for
+  trajectory plots and final metrics; also supports TLIO and older inference outputs.
 - `reference_quality.py`: shared causal reference-continuity screening.
 - `audit_reference.py`: reference jumps/gaps, raw matching metadata, and plots.
 - `summarize_ronin_6d.py`: independently verifies intermediate trajectories using
@@ -60,6 +65,8 @@ Run all 13 available recordings using a fresh output directory:
 ```bash
 run_root=outputs/ronin-new-run
 python -B scripts/ronin_pedroam_6d.py --out-root "$run_root/inference"
+# The inference command already writes trajectory_initial_aligned.csv beside
+# trajectory_local.csv in each recording directory. Optional reports follow:
 python -B scripts/summarize_ronin_6d.py "$run_root/inference"
 python -B scripts/evaluate_initial_alignment.py \
   --result-root "$run_root/inference" \
@@ -71,6 +78,14 @@ With no path arguments, the pipeline uses `outputs/ronin-current/`.
 Existing inference/alignment directories are never overwritten. To run a
 single recording, add `--session 0421-AM-2026 --person P01` to inference.
 `--max-seconds 120` provides a short test; `--cpu` disables CUDA.
+
+RoNIN also writes `initial_alignment.json` with rotation, translation, initialization
+timestamps and source hashes before scoring. `--initialization-distance-m` defaults
+to 10; use the same distance in optional evaluation to reuse the saved transform.
+Insufficient continuous reference travel or undefined heading fails explicitly,
+retaining local outputs. Aligned CSV timestamps stay at 20 Hz, with rotated ENU
+positions/velocities and an `initialization_complete` flag. Earlier points use
+the retrospectively applied transform.
 
 ## Processing and alignment
 
@@ -142,6 +157,7 @@ No ground-truth attitude, velocity, position, or bias enters the filter.
 run_root=outputs/tlio-new-run
 python -B scripts/tlio_pedroam.py --workers 8 \
   --out-root "$run_root/inference"
+# Initial-aligned CSV and comparison plot are already available. Optional report:
 python -B scripts/evaluate_initial_alignment.py \
   --result-root "$run_root/inference" \
   --out-root "$run_root/alignment-10m-continuous" --label TLIO-EKF
@@ -153,8 +169,13 @@ The default output is `outputs/tlio-current/inference`, and existing run
 folders are never overwritten. Dataset and checkpoint files remain read-only.
 The current run stores local trajectories, compressed filter diagnostics,
 input/checkpoint hashes, and explicit filter configuration. Its final aligned
-trajectories and primary metrics use the same cumulative 10 m reference-assisted
-initialization and post-initialization evaluation as RoNIN.
+trajectories use the same cumulative 10 m reference-assisted initialization as
+RoNIN and are exported directly as `trajectory_initial_aligned.csv`, with
+`initial_alignment.json`. `trajectory.png` separates raw local, initial-aligned,
+and full-overlap fitted trajectories, with matched-time error curves. The runner's
+report reuses the transform and the same plot style. Primary metrics exclude the
+initialization interval. `uncertainty_local.csv` remains in the local filter frame;
+only XY position and velocity are transformed into ENU.
 
 This is the **full TLIO network-plus-EKF baseline**, not standalone integration
 of the network's displacement predictions. RoNIN uses Madgwick throughout,
