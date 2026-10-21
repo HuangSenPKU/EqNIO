@@ -2,12 +2,12 @@
 
 中文流程、输入输出说明及可执行样例见 [Baseline 使用指南](../docs/BASELINE_USAGE_ZH.md)。快速运行：`bash scripts/run_baseline_example.sh both`。
 
-Run all selected recordings with explicit input and output locations:
+Run all selected recordings and archive results using the PedROAM convention:
 
 ```bash
 conda activate eqnio
 python -B scripts/run_baselines.py \
-  --data-root /home/maxson/data/PedROAM --out-root outputs/my-baseline-run
+  --data-root /home/maxson/data/PedROAM --test-name eqnio-baselines-v1
 ```
 
 The runner defaults to both baselines. Use `--model ronin|tlio|both`,
@@ -20,13 +20,22 @@ Both inference scripts export initial-aligned trajectories before evaluation.
 The runner forwards `--initialization-distance-m` (default 10) to both models
 and reports, storing reports under `alignment-<distance>m-continuous/`.
 
-The runner executes inference, a shared reference audit, and continuous 10 m
-alignment, then writes top-level `summary.csv` and `per_sequence.csv` for any
-number of recordings. Per-model trajectories remain under
-`<model>/inference/` and `<model>/alignment-10m-continuous/`. Stage logs and a
-status manifest are retained, including on failure. Choose a fresh output
-directory outside the dataset and checkpoint directory. The 180-second
-`run_baseline_example.sh` is a preset of this same runner.
+The runner defaults to `<data-root>/results/<session>/<person>/<test-name>/`,
+with `ronin/` and/or `tlio/` inside each experiment. Each model folder contains
+its trajectory CSVs, comparison plot, inference metadata and an `evaluation/`
+folder for initial-alignment metrics. The experiment's `summary.csv` contains
+that recording's per-model metrics, alongside `run.json` and `reference-audit/`.
+Existing experiments are refused; existing results bases and other experiments
+are preserved. Omitting `--test-name` generates a unique timestamped name.
+
+`--out-root` now means the results **base**, not the old batch work directory.
+`--work-root` defaults to repository `outputs/baseline-work/<test-name>/<timestamp>/`; it
+retains caches, logs, the old per-model inference/report layout, and batch-wide
+`summary.csv`/`per_sequence.csv`. It must be a fresh directory outside the data
+and checkpoints. Only completed runs are archived. Within PedROAM, writes are
+restricted to `results/`; recordings, rosbags and environment inputs are protected.
+The 180-second `run_baseline_example.sh` uses the same archive convention and
+accepts an optional results base as its second argument, plus `TEST_NAME`.
 
 The RoNIN pipeline uses calibrated `Gyroscope.csv` and
 `TotalAcceleration.csv`, Madgwick 6D with gain **0.033**, and the released

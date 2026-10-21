@@ -2,15 +2,15 @@
 
 本文说明当前 **EqNIO-RoNIN O2** 和 **EqNIO-TLIO O2 + EKF** 的处理流程、输入输出，以及可以自行执行的实验命令。两者均使用发布的预训练权重，不在 PedROAM 上训练或微调，用于数据集论文的 Evaluation。
 
-## 统一入口：指定数据与结果目录
+## 统一入口：按 PedROAM 规范保存正式结果
 
-激活 `eqnio` 后，只需要指定数据根目录和一个**尚不存在**的结果目录：
+激活 `eqnio` 后，指定数据根目录和实验名称。结果默认保存到 PedROAM 的 `results/`：
 
 ```bash
 conda activate eqnio
 python -B scripts/run_baselines.py \
   --data-root /home/maxson/data/PedROAM \
-  --out-root /home/maxson/code/pdr-test/EqNIO/outputs/my-baseline-run
+  --test-name eqnio-baselines-v1
 ```
 
 默认对所有匹配记录运行两条 baseline，执行顺序为：推理、共享真值检查、
@@ -25,7 +25,7 @@ python -B scripts/run_baselines.py \
 ```bash
 python -B scripts/run_baselines.py \
   --data-root /home/maxson/data/PedROAM \
-  --out-root outputs/my-tlio-run \
+  --test-name eqnio-tlio-v1 \
   --model tlio --session 0422-AM1-2026 --person P02 --workers 1
 ```
 
@@ -36,7 +36,9 @@ python -B scripts/run_baselines.py \
 | 参数 | 含义 |
 | --- | --- |
 | `--data-root` | 必填，包含 `recordings/` 的数据目录 |
-| `--out-root` | 必填，新结果目录，必须位于输入数据和权重目录之外 |
+| `--out-root` | 可选，正式结果根目录，默认 `<data-root>/results`；允许已存在 |
+| `--test-name` | 单层实验名称；省略时生成唯一 `eqnio-baselines-时间戳` 名称；同名实验拒绝覆盖 |
+| `--work-root` | 可选，尚不存在的中间工作目录，默认仓库 `outputs/baseline-work/<test-name>/<时间戳>`；必须位于数据集和权重目录之外 |
 | `--model ronin\|tlio\|both` | 运行方法，默认 `both` |
 | `--session`、`--person` | 可选记录筛选；省略时处理所有匹配记录 |
 | `--checkpoint-root` | 权重总目录，包含 `Ronin_o2/`、`TLIO_o2/` 中所选模型的子目录；默认使用本机已有权重 |
@@ -46,32 +48,45 @@ python -B scripts/run_baselines.py \
 | `--cpu` | 使用 CPU；没有可用 CUDA 时必须指定 |
 | `--dry-run` | 检查文件路径并打印命令，不推理、不创建结果目录；不验证权重内容 |
 
-输出结构如下；单模型运行只创建对应模型目录。汇总支持任意数量的记录：
+正式结果遵循 `results/<session-name>/<pedestrian-number>/<test-name>/`。同一联合实验下按模型分目录，单模型运行只创建所选模型目录：
 
 ```text
-my-baseline-run/
-├── run.json                         # 参数、选中记录、各阶段命令与完成/失败状态
-├── summary.csv                      # 各 baseline 的初始化后汇总指标
-├── per_sequence.csv                 # 各 baseline 的逐记录指标
-├── logs/                            # 推理、真值检查、对齐各阶段日志
-├── reference-audit/                 # 共享真值跳变/缺口检查、初始段图
+PedROAM/results/0423-PM-2026/P02/eqnio-baselines-v1/
+├── run.json                         # 参数、完成状态、来源工作目录及日志位置
+├── summary.csv                      # 本条记录各 baseline 的初始化后指标
+├── reference-audit/                 # 本条记录的真值检查与初始段图
 ├── ronin/
-│   ├── inference/                   # 局部轨迹、自动初始对齐轨迹与推理元数据
-│   └── alignment-10m-continuous/     # 对齐轨迹、误差、逐记录图
+│   ├── trajectory_local.csv
+│   ├── trajectory_initial_aligned.csv
+│   ├── trajectory_aligned_offline.csv
+│   ├── trajectory.png               # 三栏对比图
+│   ├── evaluation.csv               # 整段拟合诊断误差
+│   ├── initial_alignment.json
+│   ├── summary.json                 # 推理和整段拟合诊断信息
+│   ├── run.json                     # 模型推理参数及版本
+│   ├── input_quality.json
+│   ├── orientation_6d.npz
+│   └── evaluation/                  # 初始对齐后的误差、指标和图
 └── tlio/
-    ├── inference/
-    └── alignment-10m-continuous/
+    ├── ...                          # 同上轨迹、参数及 evaluation/；不含 orientation_6d.npz
+    ├── filter_diagnostics.npz
+    └── uncertainty_local.csv
 ```
+
+`--out-root` 现在表示结果根目录，不再表示旧版包含 `ronin/inference/` 的批量工作目录。
+缓存、批量日志、全体记录的 `summary.csv` 和 `per_sequence.csv` 以及原始分阶段输出保留在 `--work-root` 中。
+全部推理和评估成功后才按记录归档；`recordings/`、`rosbags/`、`environment/` 和预训练权重保持只读。
+在 PedROAM 内只能写入 `results/`。执行前检查所有目标实验目录，已有同名实验会报错，不合并、不覆盖。
 
 统一入口沿用当前修复方案：间隔 >1.5 s 或速度 >3 m/s 时重置，
 等待 10 s 后重新锚定并累计 10 m；预测/真值净位移至少 0.5 m。
-详细原理见第 3 节。论文主指标读取顶层 `summary.csv`，不要使用
-`inference/summary.csv` 中整段事后最佳对齐的诊断指标。
+详细原理见第 3 节。正式结果的 `summary.csv` 是本条记录的初始对齐指标；
+跨记录的总体均值读取工作目录根部 `summary.csv`，不要使用模型 `inference/summary.csv` 的整段拟合诊断指标。
 `initial_post_relative60_rmse_m` 在短记录没有有效配对时可能为空。
 
-运行失败会返回非零退出码，保留已完成阶段和日志，顶层 `run.json`
-标为 `failed`。不会把部分记录的结果汇总为一次成功实验，也不会自动覆盖
-或续跑已有目录。完整英文论文报告仍使用第 5 节的专用对比脚本生成。
+运行失败会返回非零退出码，工作目录的 `run.json` 标为 `failed`，保留已完成阶段和日志。
+若归档时失败，已复制完整的记录标为 `completed`，未复制完整的目标保留 `publishing` 状态，不视为成功实验。
+不会自动覆盖或续跑已有目录。完整英文论文报告仍使用第 5 节的专用对比脚本和工作目录内的分阶段结果生成。
 
 ## 1 先运行一个完整样例
 
@@ -85,7 +100,7 @@ bash scripts/run_baseline_example.sh both
 
 该样例处理 `0423-PM-2026/P02` 的前 **180 s**，依次完成两条 baseline 的推理和前累计 **10 m** 初始化评估，最后打印指标及输出目录。选择 180 s 是为了在该记录的初始化结束后保留足够的 60 s 相对位移评估区间。
 
-每次自动生成新的 `outputs/baseline-example-时间-进程号/`，不会覆盖已有实验。也可以只跑一种方法，或指定尚不存在的输出目录：
+每次默认生成 `PedROAM/results/0423-PM-2026/P02/baseline-example-时间-进程号/`，不会覆盖已有实验。也可以只跑一种方法，或指定其他结果根目录（仍追加 session/person/test-name 层级）：
 
 ```bash
 bash scripts/run_baseline_example.sh ronin
